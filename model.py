@@ -213,6 +213,48 @@ class FeedForward(nn.Module):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
+class ReluFeedForward(nn.Module):
+    def __init__(self, config: ModelArgs) -> None:
+        super().__init__()
+        self.w1 = nn.Linear(config.dim, config.intermediate_size, bias=False)
+        self.w2 = nn.Linear(config.intermediate_size, config.dim, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.w2(F.relu(self.w1(x)))
+
+
+class SparseController(nn.Module):
+    def __init__(self, config: ModelArgs) -> None:
+        super().__init__()
+        self.c1 = nn.Linear(config.dim, config.controller_rank, bias=False)
+        self.c2 = nn.Linear(config.controller_rank, config.intermediate_size, bias=False)
+
+        self.sparsity = config.ff_sparsity
+
+    def forward(self, x: Tensor) -> Tensor:
+        B, T, _ = x.size() # (T = seqlen)
+        # xC_{1}C_{2}
+        intermediate = self.c2(self.c1(x))
+        # "Reshape (-1, N)" from paper
+        # intermediate: [B * T, (d_ff / N), N]
+        # out: [B * T, (d_ff / N)] ?
+        return torch.argmax(torch.reshape(intermediate, (B * T, -1, self.sparsity)), dim=-1)
+
+
+class SparseFeedForward(nn.Module):
+    def __init__(self, config: ModelArgs) -> None:
+        super().__init__()
+        self.controller = SparseController(config)
+        
+        self.w1 = nn.Linear(config.dim, config.intermediate_size, bias=False)
+        self.w2 = nn.Linear(config.intermediate_size, config.dim, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        mask = self.controller(x)
+        # TODO: implement weight indexing a la https://github.com/google/trax/blob/a6a508e898a69fecbcce8e5b991666632c629cb0/trax/layers/research/sparsity.py#L1351
+        return self.w2(F.relu(self.w1(x)))
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
