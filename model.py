@@ -250,9 +250,33 @@ class SparseFeedForward(nn.Module):
         self.w2 = nn.Linear(config.intermediate_size, config.dim, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
+        B, T, M = x.size() # T = seqlen, M = d_model
+        
         mask = self.controller(x)
+
+        x = torch.reshape(-1, M) # x: [B * T, M] 
+
+        assert B * T == quant_mask.shape[0]
+
+    
+      # idx1 = jnp.array([jnp.arange(self._d1)] * batch_size)
+      # # flatten indices and select from w1
+      # idx1 = jnp.reshape(idx1, [-1])
+      # idx2 = jnp.reshape(quant_mask, [-1])
+      # w = w1[idx1, idx2, :]  # now we have per-element weights with batch dim
+      # w = jnp.reshape(w, [batch_size, self._d1, -1])
+      # mid = jnp.einsum('ai,aji->aj', x, w)
+      # relu = jnp.where(mid <= 0, jnp.zeros_like(mid), mid)
+      # if self._multiply_by_controller_output:
+      #   mask_mult = jnp.take_along_axis(mask, quant_mask[..., None], -1)[..., 0]
+      #   relu = relu * mask_mult
+      # # w2 is [self._d1, self._d2, d_model]
+      # v = w2[idx1, idx2, :]
+      # v = jnp.reshape(v, [batch_size, self._d1, -1])
+      # res = jnp.einsum('ai,aij->aj', relu, v) + b2
+        
         # TODO: implement weight indexing a la https://github.com/google/trax/blob/a6a508e898a69fecbcce8e5b991666632c629cb0/trax/layers/research/sparsity.py#L1351
-        return self.w2(F.relu(self.w1(x)))
+        return torch.reshape(out, (B, T, M))
 
 
 class RMSNorm(nn.Module):
