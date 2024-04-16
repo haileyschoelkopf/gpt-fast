@@ -273,8 +273,8 @@ class SparseFeedForward(nn.Module):
             return self.w2(F.relu(self.w1(x)))
         else:
             # hardcoded to ReLU + no biases
-            # unsure if for BS>1 / T>1 the idx arg is correctly formatted
-            out = mlp_sparse(x, W1=self.w1.weight, W2t=self.w2.weight.t().contiguous(), idx=mask)
+            # TODO: idx should be union of selected rows/cols across B and T axes
+            out = mlp_sparse(x, W1=self.w1.weight, W2t=self.w2.weight.t().contiguous(), idx=mask[0, :])
         
         # TODO: implement weight indexing a la https://github.com/google/trax/blob/a6a508e898a69fecbcce8e5b991666632c629cb0/trax/layers/research/sparsity.py#L1351
         return torch.reshape(out, (B, T, M))
