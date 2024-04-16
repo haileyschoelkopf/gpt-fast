@@ -249,6 +249,10 @@ class SparseFeedForward(nn.Module):
         self.w1 = nn.Linear(config.dim, config.intermediate_size, bias=False)
         self.w2 = nn.Linear(config.intermediate_size, config.dim, bias=False)
 
+        self.BACKEND = "sparse"
+
+        # self.w2.weight = self.w2.weight.t().contiguous() # ideally we'd transpose + make contiguous W2 ahead of time...
+
     def forward(self, x: Tensor) -> Tensor:
         B, T, M = x.size() # T = seqlen, M = d_model
         
@@ -256,24 +260,19 @@ class SparseFeedForward(nn.Module):
 
         x = torch.reshape(-1, M) # x: [B * T, M] 
 
-        assert B * T == quant_mask.shape[0]
+        assert B * T == mask.shape[0]
+        
 
-    
-      # idx1 = jnp.array([jnp.arange(self._d1)] * batch_size)
-      # # flatten indices and select from w1
-      # idx1 = jnp.reshape(idx1, [-1])
-      # idx2 = jnp.reshape(quant_mask, [-1])
-      # w = w1[idx1, idx2, :]  # now we have per-element weights with batch dim
-      # w = jnp.reshape(w, [batch_size, self._d1, -1])
-      # mid = jnp.einsum('ai,aji->aj', x, w)
-      # relu = jnp.where(mid <= 0, jnp.zeros_like(mid), mid)
-      # if self._multiply_by_controller_output:
-      #   mask_mult = jnp.take_along_axis(mask, quant_mask[..., None], -1)[..., 0]
-      #   relu = relu * mask_mult
-      # # w2 is [self._d1, self._d2, d_model]
-      # v = w2[idx1, idx2, :]
-      # v = jnp.reshape(v, [batch_size, self._d1, -1])
-      # res = jnp.einsum('ai,aij->aj', relu, v) + b2
+        if self.BACKEND == "naive": 
+            # TODO: convert mask to one-hot in naive backend? this should be naive, indexing in native pytorch
+            raise NotImplementedError("only kernel supported right now")
+        elif (T > 1):
+            print("prefilling... will perform dense computation")
+            return self.w2(F.relu(self.w1(x)))
+        else:
+            # hardcoded to ReLU + no biases
+            # unsure if for BS>1 / T>1 the idx arg is correctly formatted
+            out = dejavu_kernels.mlp_sparse(x, W1=self.w1.weight, W2t=self.w2.weight.t().contiguous(), idx=mask)
         
         # TODO: implement weight indexing a la https://github.com/google/trax/blob/a6a508e898a69fecbcce8e5b991666632c629cb0/trax/layers/research/sparsity.py#L1351
         return torch.reshape(out, (B, T, M))
