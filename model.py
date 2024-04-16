@@ -11,6 +11,8 @@ import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
 
+from dejavu_kernels import mlp_sparse
+
 
 def find_multiple(n: int, k: int) -> int:
     if n % k == 0:
@@ -272,7 +274,7 @@ class SparseFeedForward(nn.Module):
         else:
             # hardcoded to ReLU + no biases
             # unsure if for BS>1 / T>1 the idx arg is correctly formatted
-            out = dejavu_kernels.mlp_sparse(x, W1=self.w1.weight, W2t=self.w2.weight.t().contiguous(), idx=mask)
+            out = mlp_sparse(x, W1=self.w1.weight, W2t=self.w2.weight.t().contiguous(), idx=mask)
         
         # TODO: implement weight indexing a la https://github.com/google/trax/blob/a6a508e898a69fecbcce8e5b991666632c629cb0/trax/layers/research/sparsity.py#L1351
         return torch.reshape(out, (B, T, M))
