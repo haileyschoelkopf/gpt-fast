@@ -32,6 +32,9 @@ class ModelArgs:
     rope_base: float = 10000
     norm_eps: float = 1e-5
 
+    ff_sparsity: int = None
+    controller_rank: int = 8
+
     def __post_init__(self):
         if self.n_local_heads == -1:
             self.n_local_heads = self.n_head
@@ -64,7 +67,7 @@ transformer_configs = {
     "30B": dict(n_layer=60, n_head=52, dim=6656),
     "34B": dict(n_layer=48, n_head=64, dim=8192, vocab_size=32000, n_local_heads=8, intermediate_size=22016, rope_base=1000000), # CodeLlama-34B-Python-hf
     "70B": dict(n_layer=80, n_head=64, dim=8192, n_local_heads=8, intermediate_size=28672),
-    "Mistral-7B": dict(n_layer=32, n_head=32, n_local_heads=8, dim=4096, intermediate_size=14336, vocab_size=32000),
+    "Mistral-7B": dict(n_layer=32, n_head=32, n_local_heads=8, dim=4096, intermediate_size=14336, vocab_size=32000, ff_sparsity=256, controller_rank=16),
     "stories15M": dict(n_layer=6, n_head=6, dim=288),
     "stories110M": dict(n_layer=12, n_head=12, dim=768),
 }
@@ -142,12 +145,13 @@ class TransformerBlock(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
         super().__init__()
         self.attention = Attention(config)
-        self.feed_forward = FeedForward(config)
+        self.feed_forward = ReluFeedForward(config) if (config.ff_sparsity is None) else SparseFeedForward(config)
         self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
         self.attention_norm = RMSNorm(config.dim, config.norm_eps)
 
     def forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor) -> Tensor:
         h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos)
+        # out = h
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -232,15 +236,17 @@ class SparseController(nn.Module):
         self.c2 = nn.Linear(config.controller_rank, config.intermediate_size, bias=False)
 
         self.sparsity = config.ff_sparsity
+        self.d_model = config.intermediate_size
 
     def forward(self, x: Tensor) -> Tensor:
-        B, T, _ = x.size() # (T = seqlen)
+        BT,  _ = x.size() # (T = seqlen)
+        device = x.device
         # xC_{1}C_{2}
         intermediate = self.c2(self.c1(x))
         # "Reshape (-1, N)" from paper
         # intermediate: [B * T, (d_ff / N), N]
         # out: [B * T, (d_ff / N)] ?
-        return torch.argmax(torch.reshape(intermediate, (B * T, -1, self.sparsity)), dim=-1)
+        return torch.argmax(torch.reshape(intermediate, (BT, -1, self.sparsity)), dim=-1) + torch.arange(start=0, end=self.d_model, step=self.sparsity, device=device)
 
 
 class SparseFeedForward(nn.Module):
@@ -252,32 +258,35 @@ class SparseFeedForward(nn.Module):
         self.w2 = nn.Linear(config.intermediate_size, config.dim, bias=False)
 
         self.BACKEND = "sparse"
-
-        # self.w2.weight = self.w2.weight.t().contiguous() # ideally we'd transpose + make contiguous W2 ahead of time...
-
+        self.w2t = self.w2.weight.t().contiguous().to(torch.bfloat16).to("cuda") # ideally we'd transpose + make contiguous W2 ahead of time...
+    
     def forward(self, x: Tensor) -> Tensor:
         B, T, M = x.size() # T = seqlen, M = d_model
-        
-        mask = self.controller(x)
-
-        x = torch.reshape(-1, M) # x: [B * T, M] 
-
-        assert B * T == mask.shape[0]
-        
+       
 
         if self.BACKEND == "naive": 
             # TODO: convert mask to one-hot in naive backend? this should be naive, indexing in native pytorch
             raise NotImplementedError("only kernel supported right now")
-        elif (T > 1):
-            print("prefilling... will perform dense computation")
+        elif True: #(T > 1):
+            #print("prefilling... will perform dense computation")
             return self.w2(F.relu(self.w1(x)))
         else:
+            # import time
+            # t0 = time.perf_counter()
+            x = torch.reshape(x, (B * T, M)).contiguous() # x: [B * T, M]
+            mask = self.controller(x)
+
+            # if self.w2t is None:
+            #     self.w2t = self.w2.weight.t().contiguous()
             # hardcoded to ReLU + no biases
             # TODO: idx should be union of selected rows/cols across B and T axes
-            out = mlp_sparse(x, W1=self.w1.weight, W2t=self.w2.weight.t().contiguous(), idx=mask[0, :])
-        
-        # TODO: implement weight indexing a la https://github.com/google/trax/blob/a6a508e898a69fecbcce8e5b991666632c629cb0/trax/layers/research/sparsity.py#L1351
-        return torch.reshape(out, (B, T, M))
+            # print(x.shape, self.w1.weight.shape, self.w2t.shape, mask[0, :].shape)
+            # print(x.shape, x.dtype, self.w1.weight.shape, self.w2t.shape, mask.shape)
+            out = mlp_sparse(x, W1=self.w1.weight, W2t=self.w2t, idx=mask[0, :].contiguous())
+            #out = self.w2(F.relu(self.w1(x)))
+            # print(f"{time.perf_counter() - t0}")
+            # TODO: implement naive weight indexing a la https://github.com/google/trax/blob/a6a508e898a69fecbcce8e5b991666632c629cb0/trax/layers/research/sparsity.py#L1351
+            return torch.reshape(out, (B, T, M)).contiguous()
 
 
 class RMSNorm(nn.Module):

@@ -173,7 +173,6 @@ def generate(
     empty[:T] = prompt
     seq = empty
     input_pos = torch.arange(0, T, device=device)
-
     next_token = prefill(model, prompt.view(1, -1), input_pos, **sampling_kwargs)
     if is_speculative:
         prefill(draft_model, prompt.view(1, -1), input_pos, **sampling_kwargs)
@@ -201,7 +200,6 @@ def generate(
     else:
         generated_tokens, _ = decode_n_tokens(model, next_token.view(1, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
         seq[T + 1:] = torch.cat(generated_tokens)
-
     generate_stats = {
         'accept_counts': accept_counts
     }
@@ -215,7 +213,7 @@ def encode_tokens(tokenizer, string, bos=True, device=default_device):
 
 def _load_model(checkpoint_path, device, precision, use_tp):
     use_cuda = 'cuda' in device
-    with torch.device('meta'):
+    with torch.device('cuda'):
         model = Transformer.from_name(checkpoint_path.parent.name)
 
     if "int8" in str(checkpoint_path):
@@ -237,8 +235,9 @@ def _load_model(checkpoint_path, device, precision, use_tp):
     checkpoint = torch.load(str(checkpoint_path), mmap=True, weights_only=True)
     if "model" in checkpoint and "stories" in str(checkpoint_path):
         checkpoint = checkpoint["model"]
-    model.load_state_dict(checkpoint, assign=True)
-
+    model.load_state_dict(checkpoint, assign=True, strict=False)
+    # hacky bc we're trying to test while having some params randomly init'ed 
+    
     if use_tp:
         from tp import apply_tp
         print("Applying tensor parallel to model ...")

@@ -130,14 +130,15 @@ def leaky_relu_grad(x):
 @triton.jit
 def gelu(x):
     """Gaussian Error Linear Unit (GELU)"""
-    return x * 0.5 * (1.0 + tl.libdevice.erf(x * _sqrt1_2))
+    raise NotImplementedError #return x * 0.5 * (1.0 + tl.libdevice.erf(x * _sqrt1_2))
 
 
 @triton.jit
 def gelu_grad(x):
-    cdf = 0.5 * (1.0 + tl.libdevice.erf(x * _sqrt1_2))
-    pdf = tl.exp(-0.5 * x * x) * _gaussian_pdf_normalization
-    return cdf + x * pdf
+    raise NotImplementedError
+    #cdf = 0.5 * (1.0 + tl.libdevice.erf(x * _sqrt1_2))
+    #pdf = tl.exp(-0.5 * x * x) * _gaussian_pdf_normalization
+    #return cdf + x * pdf
 
 @triton.jit
 def gelu_approx(x):
@@ -248,7 +249,7 @@ def gather_gemv_kernel(
         for n in range(N, 0, -BLOCK_N):
             a = tl.load(A) if EVEN_N else tl.load(A, mask=rn[None, :] < n, other=0.0)
             x0 = tl.load(X) if EVEN_N else tl.load(X, mask=rn < n, other=0.0)
-            acc0 += tl.sum(a.to(tl.float32) * x0.to(tl.float32)[None, :], 1)
+            acc0 += tl.sum((a * x0[None, :]).to(tl.float32), 1)
             A += BLOCK_N
             X += BLOCK_N
         if HAS_BIAS:
@@ -484,7 +485,7 @@ def gather_transposed_gemv_kernel(
                 if EVEN_N
                 else tl.load(A_ptr, mask=rn[None, :] < N, other=0.0)
             )
-            acc0 += tl.sum(a.to(tl.float32) * x0.to(tl.float32)[:, None], 0)
+            acc0 += tl.sum((a * x0[:, None]).to(tl.float32), 0)
             IDX += BLOCK_M
             X += BLOCK_M
         if HAS_BIAS:
@@ -666,7 +667,7 @@ def gather_transposed_gemv_atomicadd_kernel(
     a = tl.load(A) if EVEN_N else tl.load(A, mask=rn[None, :] < N, other=0.0)
     if BATCHSIZE == 1:
         x0 = tl.load(X, mask=rm < M, other=0.0)
-        acc0 = tl.sum(a.to(tl.float32) * x0.to(tl.float32)[:, None], 0)
+        acc0 = tl.sum((a * x0[:, None]).to(tl.float32), 0)
         if HAS_BIAS:
             if start_m == 0:
                 bias = tl.load(BIAS, mask=rn < N, other=0.0).to(tl.float32)
