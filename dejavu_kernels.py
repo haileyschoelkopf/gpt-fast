@@ -172,25 +172,24 @@ def apply_activation(x, ACTIVATION: tl.constexpr):
         x = squared_relu(x)
     return x
 
-
+# @triton.heuristics(
+#     {
+#         "EVEN_N": lambda args: args["N"] % args["BLOCK_N"] == 0,
+#     }
+# )
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_M": 4, "BLOCK_N": 256}, num_warps=4),
-        triton.Config({"BLOCK_M": 4, "BLOCK_N": 512}, num_warps=4),
-        triton.Config({"BLOCK_M": 4, "BLOCK_N": 1024}, num_warps=4),
-        triton.Config({"BLOCK_M": 8, "BLOCK_N": 256}, num_warps=4),
-        triton.Config({"BLOCK_M": 8, "BLOCK_N": 512}, num_warps=4),
-        triton.Config({"BLOCK_M": 8, "BLOCK_N": 1024}, num_warps=4),
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 256}, num_warps=4),
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 512}, num_warps=4),
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 1024}, num_warps=4),
+        triton.Config({"BLOCK_M": 4, "BLOCK_N": 256}, ), #num_warps=4),
+        triton.Config({"BLOCK_M": 4, "BLOCK_N": 512}, ), #num_warps=4),
+        triton.Config({"BLOCK_M": 4, "BLOCK_N": 1024}, ), #num_warps=4),
+        triton.Config({"BLOCK_M": 8, "BLOCK_N": 256}, ), #num_warps=4),
+        triton.Config({"BLOCK_M": 8, "BLOCK_N": 512}, ), #num_warps=4),
+        triton.Config({"BLOCK_M": 8, "BLOCK_N": 1024}, ), #num_warps=4),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 256}, ), #num_warps=4),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 512}, ), #num_warps=4),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 1024}, ), #num_warps=4),
     ],
     key=["CACHE_KEY_M", "CACHE_KEY_N", "BATCHSIZE"],
-)
-@triton.heuristics(
-    {
-        "EVEN_N": lambda args: args["N"] % args["BLOCK_N"] == 0,
-    }
 )
 @triton.jit
 def gather_gemv_kernel(
@@ -365,7 +364,7 @@ def gather_gemv(
     """
     assert activation in ["id", "relu", "gelu", "gelu_approx", "squared_relu"]
     Z, N = weight.shape
-    batch, _ = x.shape
+    batch, T, _ = x.shape
     assert x.shape == (batch, N)
     assert batch in [1, 2, 3, 4]
     (M,) = idx.shape
@@ -402,6 +401,7 @@ def gather_gemv(
         batch,  # Can't use kwargs because auto-tuner requires args
         HAS_BIAS=bias is not None,
         ACTIVATION=activation,
+        EVEN_N=True,
     )
 
     return output
@@ -412,24 +412,23 @@ def gather_gemv(
 # The tradeoff is that the other implementation has to do atomic add on the output.
 # But overall it's still faster.
 
-
+# @triton.heuristics(
+#     {
+#         "EVEN_N": lambda args: args["N"] % args["BLOCK_N"] == 0,
+#     }
+# )
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 1024}, num_warps=4),
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 512}, num_warps=4),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 512}, num_warps=4),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 256}, num_warps=4),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_warps=4),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=4),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=4),
-        triton.Config({"BLOCK_M": 256, "BLOCK_N": 64}, num_warps=4),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 1024}, ), #num_warps=4),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 512}, ), #num_warps=4),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 512}, ), #num_warps=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 256}, ), #num_warps=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, ), #num_warps=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, ), #num_warps=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, ), #num_warps=4),
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 64}, ), #num_warps=4),
     ],
     key=["CACHE_KEY_M", "CACHE_KEY_N", "BATCHSIZE"],
-)
-@triton.heuristics(
-    {
-        "EVEN_N": lambda args: args["N"] % args["BLOCK_N"] == 0,
-    }
 )
 @triton.jit
 def gather_transposed_gemv_kernel(
@@ -582,40 +581,40 @@ def init_to_zero(name):
     return lambda nargs: nargs[name].zero_()
 
 
-@triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_M": 32, "BLOCK_N": 256}, num_warps=4, pre_hook=init_to_zero("Y")
-        ),
-        triton.Config(
-            {"BLOCK_M": 32, "BLOCK_N": 512}, num_warps=4, pre_hook=init_to_zero("Y")
-        ),
-        triton.Config(
-            {"BLOCK_M": 32, "BLOCK_N": 1024}, num_warps=4, pre_hook=init_to_zero("Y")
-        ),
-        triton.Config(
-            {"BLOCK_M": 32, "BLOCK_N": 2048}, num_warps=8, pre_hook=init_to_zero("Y")
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 256}, num_warps=4, pre_hook=init_to_zero("Y")
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 512}, num_warps=4, pre_hook=init_to_zero("Y")
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 1024}, num_warps=4, pre_hook=init_to_zero("Y")
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 2048}, num_warps=8, pre_hook=init_to_zero("Y")
-        ),
-    ],
-    key=["CACHE_KEY_M", "CACHE_KEY_N", "BATCHSIZE"],
-)
-@triton.heuristics(
-    {
-        "EVEN_N": lambda args: args["N"] % args["BLOCK_N"] == 0,
-    }
-)
+# @triton.autotune(
+#     configs=[
+#         triton.Config(
+#             {"BLOCK_M": 32, "BLOCK_N": 256}, num_warps=4, #pre_hook=init_to_zero("Y")
+#         ),
+#         triton.Config(
+#             {"BLOCK_M": 32, "BLOCK_N": 512}, num_warps=4, #pre_hook=init_to_zero("Y")
+#         ),
+#         triton.Config(
+#             {"BLOCK_M": 32, "BLOCK_N": 1024}, num_warps=4, #pre_hook=init_to_zero("Y")
+#         ),
+#         triton.Config(
+#             {"BLOCK_M": 32, "BLOCK_N": 2048}, num_warps=8, #pre_hook=init_to_zero("Y")
+#         ),
+#         triton.Config(
+#             {"BLOCK_M": 64, "BLOCK_N": 256}, num_warps=4, #pre_hook=init_to_zero("Y")
+#         ),
+#         triton.Config(
+#             {"BLOCK_M": 64, "BLOCK_N": 512}, num_warps=4, #pre_hook=init_to_zero("Y")
+#         ),
+#         triton.Config(
+#             {"BLOCK_M": 64, "BLOCK_N": 1024}, num_warps=4, #pre_hook=init_to_zero("Y")
+#         ),
+#         triton.Config(
+#             {"BLOCK_M": 64, "BLOCK_N": 2048}, num_warps=8, #pre_hook=init_to_zero("Y")
+#         ),
+#     ],
+#     key=["CACHE_KEY_M", "CACHE_KEY_N", "BATCHSIZE"],
+# )
+# @triton.heuristics(
+#     {
+#         "EVEN_N": lambda args: args["N"] % args["BLOCK_N"] == 0,
+#     }
+# )
 @triton.jit
 def gather_transposed_gemv_atomicadd_kernel(
     Y,  # Pointers to matrices
@@ -755,8 +754,8 @@ def gather_transposed_gemv(
             x.dtype == bias.dtype
         ), f"Input and bias must have the same dtype, got {x.dtype} and {bias.dtype}"
 
-    # kernel_type = "deterministic"
-    kernel_type = "atomicadd"  # This always seems to be faster for now
+    kernel_type = "deterministic"
+    # kernel_type = "atomicadd"  # This always seems to be faster for now
 
     output = torch.empty(
         batch,
@@ -792,6 +791,7 @@ def gather_transposed_gemv(
         weight.stride(0),  # strides
         batch,  # can't use kwargs because auto-tuner requires args
         HAS_BIAS=bias is not None,
+        EVEN_N=True,
     )
 
     return output.to(dtype=x.dtype)
