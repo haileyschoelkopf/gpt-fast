@@ -365,7 +365,8 @@ def gather_gemv(
     assert activation in ["id", "relu", "gelu", "gelu_approx", "squared_relu"]
     Z, N = weight.shape
     batch, T, _ = x.shape
-    assert x.shape == (batch, N)
+    assert x.shape == (batch, T, N)
+    assert T == 1
     assert batch in [1, 2, 3, 4]
     (M,) = idx.shape
     x = x.contiguous()
