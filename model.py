@@ -31,9 +31,10 @@ class ModelArgs:
     norm_eps: float = 1e-5
 
     attention_type: Literal["mha", "mla"] = "mha"
-    q_lora_rank: int = None
+    q_lora_rank: int = 512
     kv_lora_rank: int = 512
     rope_head_dim: int = 64
+    mla_absorption: bool = True
 
     # TODO: all the args we need to toggle
 
@@ -251,8 +252,8 @@ class LatentAttention(nn.Module):
 
     def __init__(self, config: ModelArgs):
         super().__init__()
+        self.config = config
         # TODO: size checks, as with Attention above
-        
         self.n_head = config.n_head
 
         self.nope_head_dim = config.head_dim
@@ -290,6 +291,9 @@ class LatentAttention(nn.Module):
 
         self.kv_cache = None
 
+        if config.mla_absorption: 
+            self.absorb()
+
         # TODO: write a load hook to make us not require ckpt conversion script w/ renaming?
         # TODO: load hook should handle the "absorption" effect. if we even wanna do absorption
         # TODO TODO: if absorption isn't "worth it" in terms of speedups in practicality--just stick a RoPE in there!
@@ -297,7 +301,43 @@ class LatentAttention(nn.Module):
 
         # TODO: figure out what's going on w/ expansion ratios in Deepseek MLA (Jianlin Su blogpost: head_dim * n_head = 16384 instead of dim = 5120 for Deepseek-v2. Why/how?)
 
+    def absorb(self):
+        assert self.config.q_lora_rank is not None
+
+        # in: WUQ: [n_head * q_head_dim, q_lora_rank], WUKV: [n_head * (q_head_dim), kv_lora_rank], WO: [dim, n_head * v_head_dim]
+
+        # split apart RoPE and NoPE components of the Q up-projection (W_UQ), and store RoPE portion separately        
+        wuq = self.wuq.weight.view(self.n_head, self.q_head_dim, self.q_lora_rank)
+
+        wuq_nope, wuq_rope = wuq.split([self.nope_head_dim, self.rope_head_dim], dim=1)
+
+        self.wuq_rope = wuq_rope.clone().contiguous().to(dtype=torch.bfloat16)
+
+        # split K,V up-proj (W_UKV) into K and V components
+        wukv = self.wukv.weight.view(self.n_head, -1, self.kv_lora_rank)
+
+        wuk, wuv = wukv.split([self.nope_head_dim, self.v_head_dim], dim=1)
+
+        # get W_O
+        wo = self.wo.weight.view(self.dim, self.n_head, self.v_head_dim)
+
+        # produce 'W_UQK', the absorbed combined Q- and K- NoPE up-projection: 
+        # wuqk = torch.einsum("n_head nope_head_dim q_lora_rank, n_head nope_head_dim kv_lora_rank -> kv_lora_rank n_head q_lora_rank", wuq_nope, wuk)
+        wuqk = torch.einsum("n h q, n h k -> k n q", wuq_nope, wuk)
+        self.wuqk = wuqk.clone().contiguous().to(dtype=torch.bfloat16)
+
+        # produce 'W_OV', the absorbed combined V- up-proj and O out projection
+        # wov = torch.einsum("n_head v_head_dim kv_lora_rank, dim n_head v_head_dim -> dim n_head kv_lora_rank", wuv, wo)
+        wov = torch.einsum("n v k, d n v -> d n k", wuv, wo)
+        self.wov = wov.clone().contiguous().to(dtype=torch.bfloat16)
+
+        # out: WUQK: [kv_lora_rank, n_head, q_lora_rank], WUQ_rope: [n_head * rope_head_dim, q_lora_rank], WOV: [dim, n_head, kv_lora_rank]
+
+
+
     def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+        return self.forward_absorbed(x, freqs_cis, mask, input_pos)
+        
         bsz, seqlen, _ = x.shape
 
         # run q proj (Q_DQ, Q_UQ) and get Q_nope, Q_pe
@@ -313,6 +353,8 @@ class LatentAttention(nn.Module):
         compressed_kv, k_rope = self.wdkv_kr(x).split([self.kv_lora_rank, self.rope_head_dim], dim=-1)
         # TODO: should KR proj be separate from DKV weight? or better to do it combined
         k_rope = k_rope.view(bsz, -1, 1, self.rope_head_dim)
+
+        # TODO: push kv LN prior to caching
 
         # use KV cache: cache the compressed_kv ; uncompressed rotary K
         if self.kv_cache is not None:
@@ -346,6 +388,93 @@ class LatentAttention(nn.Module):
 
         y = self.wo(y)
         return y
+
+    def forward_absorbed(self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+
+        bsz, seqlen, _ = x.shape
+
+
+        c_q = self.q_lora_norm(self.wdq(x))
+
+        #q_nope = torch.einsum('bsz seqlen q_lora_rank, kv_lora_rank n_head q_lora_rank -> bsz seqlen n_head kv_lora_rank', c_q, self.wuqk)
+        q_nope = torch.einsum('b s q, k n q -> b s n k', c_q, self.wuqk)
+        # q_rope = torch.einsum('bsz seqlen q_lora_rank, n_head rope_head_dim q_lora_rank -> bsz seqlen n_head rope_head_dim', c_q, self.wuq_rope)
+        q_rope = torch.einsum('b s q, n r q -> b s n r', c_q, self.wuq_rope)
+
+        # run combined DKV + KR --> get compressed KV and k_rope
+        compressed_kv, k_rope = self.wdkv_kr(x).split([self.kv_lora_rank, self.rope_head_dim], dim=-1)
+        # TODO: should KR proj be separate from DKV weight? or better to do it combined
+        k_rope = k_rope.view(bsz, -1, 1, self.rope_head_dim)
+
+        # use KV cache: cache the compressed_kv ; uncompressed rotary K
+        if self.kv_cache is not None:
+            # TODO write a MLA (compressed) KV cache
+            compressed_kv, k_rope = self.kv_cache.update(input_pos, compressed_kv, k_rope)
+
+        compressed_kv = self.kv_lora_norm(compressed_kv)
+
+        # # up-project compressed_kv and split out uncompressed k_nope and value states
+        # # run wUK, wUV to get uncompressed k_nope and get uncompressed v
+        # kv = self.wukv(self.kv_lora_norm(compressed_kv))
+
+        # k_nope, v = kv.view(bsz, -1, self.n_head, self.nope_head_dim + self.v_head_dim).split([self.nope_head_dim, self.v_head_dim], dim=-1)
+
+        # apply rotary to q_rope, k_rope
+        q_rope = apply_rotary_emb(q_rope, freqs_cis[input_pos])
+        k_rope = apply_rotary_emb(k_rope, freqs_cis[:k_rope.shape[1], ...]) # we are reapplying RoPE to the entire k_rope history each time at runtime.
+
+        # TODO: don't use cat -- unless torch compile does a good job of making things fast
+        # repeat our RoPE MQA K head.
+        k_rope = k_rope.repeat_interleave(self.n_head, dim=2)
+
+        # print(compressed_kv.shape)
+        # concat k_nope, k_rope together ; q_nope, q_rope together
+        # q = torch.cat((q_nope, q_rope), dim=-1)
+        # k = torch.cat((compressed_kv, k_rope), dim=-1)
+
+        q_rope, k_rope, q_nope = map(lambda x: x.transpose(1, 2), (q_rope, k_rope, q_nope))
+
+        # do attention computation.
+        y = my_scaled_dot_product_attention(q_rope, q_nope, k_rope, compressed_kv, attn_mask=mask, dropout_p=0.0, scale=self.q_head_dim)
+
+        # y = torch.einsum('bsz n_head seqlen kv_lora_rank, dim n_head kv_lora_rank -> bsz seqlen dim', y, self.wov)
+        y = torch.einsum('b n s k, d n k -> b s d', y, self.wov)
+        # y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
+
+        # y = self.wo(y)
+        return y
+
+
+def my_scaled_dot_product_attention(q_rope, q_nope, k_rope, compressed_kv, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None) -> torch.Tensor:
+    """Copy of the torch SDPA reference code, edited to compute w/o 
+    torch.cat or extra copies. Somewhat cursed    
+    """
+    
+    L, S = q_rope.size(-2), k_rope.size(-2)
+    assert scale is not None, "require passing scale explicitly"
+    assert attn_mask is not None, "assuming we pass attn_mask explicitly"
+    scale_factor = 1 / math.sqrt(q_rope.size(-1)) if scale is None else scale
+    attn_bias = torch.zeros(1, 1, L, S, dtype=q_rope.dtype, device=q_rope.device)
+    if is_causal:
+        assert attn_mask is None
+        temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+        attn_bias.to(q_rope.dtype)
+
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        else:
+            attn_bias += attn_mask
+
+    # as in madsys blogpost, split out rope and nope computation
+    attn_weight = q_rope @ k_rope.transpose(-2, -1) * scale_factor
+    # TODO: ensure the unsqueeze is doing what we want here
+    attn_weight += q_nope @ compressed_kv.unsqueeze(-3).transpose(-2, -1) * scale_factor
+    attn_weight += attn_bias
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+    return attn_weight @ compressed_kv
 
 
 class FeedForward(nn.Module):
