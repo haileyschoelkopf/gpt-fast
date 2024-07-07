@@ -213,7 +213,7 @@ def encode_tokens(tokenizer, string, bos=True, device=default_device):
 
 def _load_model(checkpoint_path, device, precision, use_tp):
     use_cuda = 'cuda' in device
-    with torch.device('meta'):
+    with torch.device('cuda'): # TODO: fix this...................
         model = Transformer.from_name(checkpoint_path.parent.name)
 
     if "int8" in str(checkpoint_path):
@@ -233,7 +233,7 @@ def _load_model(checkpoint_path, device, precision, use_tp):
     checkpoint = torch.load(str(checkpoint_path), mmap=True, weights_only=True)
     if "model" in checkpoint and "stories" in str(checkpoint_path):
         checkpoint = checkpoint["model"]
-    model.load_state_dict(checkpoint, assign=True)
+    model.load_state_dict(checkpoint, assign=True, strict=False)
 
     if use_tp:
         from tp import apply_tp

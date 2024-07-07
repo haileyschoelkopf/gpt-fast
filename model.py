@@ -4,7 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Literal
 
 import torch
 import torch.nn as nn
@@ -29,6 +29,13 @@ class ModelArgs:
     head_dim: int = 64
     rope_base: float = 10000
     norm_eps: float = 1e-5
+
+    attention_type: Literal["mha", "mla"] = "mha"
+    q_lora_rank: int = None
+    kv_lora_rank: int = 512
+    rope_head_dim: int = 64
+
+    # TODO: all the args we need to toggle
 
     def __post_init__(self):
         if self.n_local_heads == -1:
@@ -62,7 +69,8 @@ transformer_configs = {
     "30B": dict(n_layer=60, n_head=52, dim=6656),
     "34B": dict(n_layer=48, n_head=64, dim=8192, vocab_size=32000, n_local_heads=8, intermediate_size=22016, rope_base=1000000), # CodeLlama-34B-Python-hf
     "70B": dict(n_layer=80, n_head=64, dim=8192, n_local_heads=8, intermediate_size=28672),
-    "Mistral-7B": dict(n_layer=32, n_head=32, n_local_heads=8, dim=4096, intermediate_size=14336, vocab_size=32000),
+    # "Mistral-7B": dict(n_layer=32, n_head=32, n_local_heads=8, dim=4096, intermediate_size=14336, vocab_size=32000),
+    "Mistral-7B": dict(block_size=4096, n_layer=32, n_head=32, attention_type="mla", dim=4096, intermediate_size=14336, vocab_size=32000),
     "stories15M": dict(n_layer=6, n_head=6, dim=288),
     "stories110M": dict(n_layer=12, n_head=12, dim=768),
 
@@ -87,6 +95,28 @@ class KVCache(nn.Module):
         v_out[:, :, input_pos] = v_val
 
         return k_out, v_out
+
+class MLACache(nn.Module):
+    def __init__(self, max_batch_size, max_seq_length, kv_lora_rank, rope_head_dim, dtype=torch.bfloat16):
+        super().__init__()
+        compressed_kv_shape = (max_batch_size, max_seq_length, kv_lora_rank)
+        k_rope_shape = (max_batch_size, max_seq_length, 1, rope_head_dim)
+
+        self.register_buffer('compressed_kv_cache', torch.zeros(compressed_kv_shape, dtype=dtype))
+        self.register_buffer('k_rope_cache', torch.zeros(k_rope_shape, dtype=dtype))
+
+    def update(self, input_pos, compressed_kv_val, k_rope_val):
+        # input_pos: [S], compressed_kv_val: [B, S, KV_rank], k_rope_val: [B, S, 1, H_rope]
+        assert input_pos.shape[0] == compressed_kv_val.shape[1]
+
+        compressed_kv_out = self.compressed_kv_cache
+        k_rope_out = self.k_rope_cache
+        compressed_kv_out[:, input_pos, :] = compressed_kv_val
+        k_rope_out[:, input_pos, :, :] = k_rope_val
+
+        return compressed_kv_out, k_rope_out
+
+
 
 class Transformer(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
@@ -117,15 +147,21 @@ class Transformer(nn.Module):
         elif hasattr(self.output, "scales_and_zeros"):
             dtype = self.output.scales_and_zeros.dtype
         for b in self.layers:
-            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim, dtype)
+            if self.config.attention_type == "mha":
+                b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim, dtype)
+            else:
+                b.attention.kv_cache = MLACache(max_batch_size, max_seq_length, self.config.kv_lora_rank, self.config.rope_head_dim, dtype)
 
-        self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base, dtype)
+        if self.config.attention_type == "mha":
+            self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base, dtype)
+        else:
+            self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.rope_head_dim, self.config.rope_base, dtype)
         self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
 
     def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
         mask = self.causal_mask[None, None, input_pos]
-        freqs_cis = self.freqs_cis[input_pos]
+        freqs_cis = self.freqs_cis
         x = self.tok_embeddings(idx)
 
         for i, layer in enumerate(self.layers):
@@ -142,7 +178,7 @@ class Transformer(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
         super().__init__()
-        self.attention = Attention(config)
+        self.attention = Attention(config) if config.attention_type == "mha" else LatentAttention(config)
         self.feed_forward = FeedForward(config)
         self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
         self.attention_norm = RMSNorm(config.dim, config.norm_eps)
@@ -187,8 +223,8 @@ class Attention(nn.Module):
         k = k.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.n_local_heads, self.head_dim)
 
-        q = apply_rotary_emb(q, freqs_cis)
-        k = apply_rotary_emb(k, freqs_cis)
+        q = apply_rotary_emb(q, freqs_cis[input_pos])
+        k = apply_rotary_emb(k, freqs_cis[input_pos])
 
         q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
 
@@ -206,6 +242,13 @@ class Attention(nn.Module):
 
 
 class LatentAttention(nn.Module):
+    """Fast Multi-headed Latent Attention. 
+
+    This implementation referenced the published code in 
+    https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite/blob/main/modeling_deepseek.py
+    and implements some of the optimizations described in the MAD-sys blogpost (although I have not atm referenced the madsys code when writing this.)
+    """
+
     def __init__(self, config: ModelArgs):
         super().__init__()
         # TODO: size checks, as with Attention above
@@ -213,21 +256,37 @@ class LatentAttention(nn.Module):
         self.n_head = config.n_head
 
         self.nope_head_dim = config.head_dim
-        self.rope_head_dim = 64 # TODO: un-hardcode
+        self.rope_head_dim = config.rope_head_dim # TODO: un-hardcode
 
         self.q_head_dim = self.nope_head_dim + self.rope_head_dim
 
+        self.v_head_dim = self.nope_head_dim #TODO: can this be different from QK head dim?
+
         self.dim = config.dim 
 
-        # TODO: init weights
+        self.q_lora_rank = config.q_lora_rank
+        self.kv_lora_rank = config.kv_lora_rank
 
         # init q_lora proj (OR: full-rank wq)
         # as well as RMSNorm if lora
+        if self.q_lora_rank is not None:
+            self.wdq = nn.Linear(self.dim, self.q_lora_rank, bias=False)
+            self.q_lora_norm = RMSNorm(self.q_lora_rank, config.norm_eps)
+            self.wuq = nn.Linear(self.q_lora_rank, self.n_head * self.q_head_dim, bias=False)
+        else:
+            self.wq = nn.Linear(self.dim, self.n_head * self.q_head_dim, bias=False)
+
 
         # init kv lora proj
+        # (combined W_DKV and W_KR from MLA eqns)
+        self.wdkv_kr = nn.Linear(self.dim, self.kv_lora_rank + self.rope_head_dim, bias=False)
 
-        # init o proj
-        self.wo = nn.Linear(, bias=False)
+        self.kv_lora_norm = RMSNorm(self.kv_lora_rank, config.norm_eps)
+
+        # combined w_uk, w_uv
+        self.wukv = nn.Linear(config.kv_lora_rank, self.n_head * (self.nope_head_dim + self.v_head_dim), bias=False)
+
+        self.wo = nn.Linear(self.n_head * self.v_head_dim, self.dim, bias=False)
 
         self.kv_cache = None
 
@@ -239,34 +298,49 @@ class LatentAttention(nn.Module):
         # TODO: figure out what's going on w/ expansion ratios in Deepseek MLA (Jianlin Su blogpost: head_dim * n_head = 16384 instead of dim = 5120 for Deepseek-v2. Why/how?)
 
     def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+        bsz, seqlen, _ = x.shape
 
         # run q proj (Q_DQ, Q_UQ) and get Q_nope, Q_pe
+        if self.q_lora_rank is not None:
+            q = self.wuq(self.q_lora_norm(self.wdq(x)))
+        else:
+            q = self.wq(x)
+
+        q = q.view(bsz, seqlen, self.n_head, self.q_head_dim)
+        q_nope, q_rope = q.split([self.nope_head_dim, self.rope_head_dim], dim=-1)
 
         # run combined DKV + KR --> get compressed KV and k_rope
-
+        compressed_kv, k_rope = self.wdkv_kr(x).split([self.kv_lora_rank, self.rope_head_dim], dim=-1)
         # TODO: should KR proj be separate from DKV weight? or better to do it combined
+        k_rope = k_rope.view(bsz, -1, 1, self.rope_head_dim)
 
         # use KV cache: cache the compressed_kv ; uncompressed rotary K
         if self.kv_cache is not None:
             # TODO write a MLA (compressed) KV cache
-            k, v = self.kv_cache.update(input_pos, compressed_kv, k_rope)
+            compressed_kv, k_rope = self.kv_cache.update(input_pos, compressed_kv, k_rope)
 
         # up-project compressed_kv and split out uncompressed k_nope and value states
+        # run wUK, wUV to get uncompressed k_nope and get uncompressed v
+        kv = self.wukv(self.kv_lora_norm(compressed_kv))
 
-        # run wUK to get uncompressed k_nope
+        k_nope, v = kv.view(bsz, -1, self.n_head, self.nope_head_dim + self.v_head_dim).split([self.nope_head_dim, self.v_head_dim], dim=-1)
 
         # apply rotary to q_rope, k_rope
-        q_rope = apply_rotary_emb(q_rope, freqs_cis)
-        k_rope = apply_rotary_emb(k_rope, freqs_cis)
+        q_rope = apply_rotary_emb(q_rope, freqs_cis[input_pos])
+        k_rope = apply_rotary_emb(k_rope, freqs_cis[:k_rope.shape[1], ...]) # we are reapplying RoPE to the entire k_rope history each time at runtime.
+
+        # TODO: don't use cat -- unless torch compile does a good job of making things fast
+        # repeat our RoPE MQA K head.
+        k_rope = k_rope.repeat_interleave(self.n_head, dim=2)
 
         # concat k_nope, k_rope together ; q_nope, q_rope together
-        # TODO: don't use cat -- unless torch compile does a good job of making things fast
         q = torch.cat((q_nope, q_rope), dim=-1)
-
         k = torch.cat((k_nope, k_rope), dim=-1)
 
+        q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
+
         # do attention computation.
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0) # TODO: ensure we are using the correct softmax_scale
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 
