@@ -326,17 +326,20 @@ class LatentAttention(nn.Module):
         wuqk = torch.einsum("n h q, n h k -> k n q", wuq_nope, wuk)
         self.wuqk = wuqk.clone().contiguous().to(dtype=torch.bfloat16)
 
+        # TODO: test this and compare--what if we don't absorb W_UV into W_O?
+        self.wuv = wuv.clone().contiguous().to(dtype=torch.bfloat16)
         # produce 'W_OV', the absorbed combined V- up-proj and O out projection
         # wov = torch.einsum("n_head v_head_dim kv_lora_rank, dim n_head v_head_dim -> dim n_head kv_lora_rank", wuv, wo)
-        wov = torch.einsum("n v k, d n v -> d n k", wuv, wo)
-        self.wov = wov.clone().contiguous().to(dtype=torch.bfloat16)
+        # wov = torch.einsum("n v k, d n v -> d n k", wuv, wo)
+        # self.wov = wov.clone().contiguous().to(dtype=torch.bfloat16)
 
         # out: WUQK: [kv_lora_rank, n_head, q_lora_rank], WUQ_rope: [n_head * rope_head_dim, q_lora_rank], WOV: [dim, n_head, kv_lora_rank]
 
 
 
     def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
-        return self.forward_absorbed(x, freqs_cis, mask, input_pos)
+        if self.config.mla_absorption:
+            return self.forward_absorbed(x, freqs_cis, mask, input_pos)
         
         bsz, seqlen, _ = x.shape
 
@@ -438,10 +441,11 @@ class LatentAttention(nn.Module):
         y = my_scaled_dot_product_attention(q_rope, q_nope, k_rope, compressed_kv, attn_mask=mask, dropout_p=0.0, scale=self.q_head_dim)
 
         # y = torch.einsum('bsz n_head seqlen kv_lora_rank, dim n_head kv_lora_rank -> bsz seqlen dim', y, self.wov)
-        y = torch.einsum('b n s k, d n k -> b s d', y, self.wov)
-        # y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
+        y = torch.einsum('b n s k, n v k -> b n s v', y, self.wuv)
 
-        # y = self.wo(y)
+        y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
+
+        y = self.wo(y)
         return y
 
 
@@ -467,7 +471,7 @@ def my_scaled_dot_product_attention(q_rope, q_nope, k_rope, compressed_kv, attn_
         else:
             attn_bias += attn_mask
 
-    # as in madsys blogpost, split out rope and nope computation
+    # as in madsys blogpost, split out rope and nope attn weight computation
     attn_weight = q_rope @ k_rope.transpose(-2, -1) * scale_factor
     # TODO: ensure the unsqueeze is doing what we want here
     attn_weight += q_nope @ compressed_kv.unsqueeze(-3).transpose(-2, -1) * scale_factor
