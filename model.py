@@ -205,6 +205,75 @@ class Attention(nn.Module):
         return y
 
 
+class LatentAttention(nn.Module):
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        # TODO: size checks, as with Attention above
+        
+        self.n_head = config.n_head
+
+        self.nope_head_dim = config.head_dim
+        self.rope_head_dim = 64 # TODO: un-hardcode
+
+        self.q_head_dim = self.nope_head_dim + self.rope_head_dim
+
+        self.dim = config.dim 
+
+        # TODO: init weights
+
+        # init q_lora proj (OR: full-rank wq)
+        # as well as RMSNorm if lora
+
+        # init kv lora proj
+
+        # init o proj
+        self.wo = nn.Linear(, bias=False)
+
+        self.kv_cache = None
+
+        # TODO: write a load hook to make us not require ckpt conversion script w/ renaming?
+        # TODO: load hook should handle the "absorption" effect. if we even wanna do absorption
+        # TODO TODO: if absorption isn't "worth it" in terms of speedups in practicality--just stick a RoPE in there!
+            # TODO: check if ditching the RoPE head gives us a speedup after we perform move elision. it may not be a slowdown to use the uncompressed rope head.
+
+        # TODO: figure out what's going on w/ expansion ratios in Deepseek MLA (Jianlin Su blogpost: head_dim * n_head = 16384 instead of dim = 5120 for Deepseek-v2. Why/how?)
+
+    def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+
+        # run q proj (Q_DQ, Q_UQ) and get Q_nope, Q_pe
+
+        # run combined DKV + KR --> get compressed KV and k_rope
+
+        # TODO: should KR proj be separate from DKV weight? or better to do it combined
+
+        # use KV cache: cache the compressed_kv ; uncompressed rotary K
+        if self.kv_cache is not None:
+            # TODO write a MLA (compressed) KV cache
+            k, v = self.kv_cache.update(input_pos, compressed_kv, k_rope)
+
+        # up-project compressed_kv and split out uncompressed k_nope and value states
+
+        # run wUK to get uncompressed k_nope
+
+        # apply rotary to q_rope, k_rope
+        q_rope = apply_rotary_emb(q_rope, freqs_cis)
+        k_rope = apply_rotary_emb(k_rope, freqs_cis)
+
+        # concat k_nope, k_rope together ; q_nope, q_rope together
+        # TODO: don't use cat -- unless torch compile does a good job of making things fast
+        q = torch.cat((q_nope, q_rope), dim=-1)
+
+        k = torch.cat((k_nope, k_rope), dim=-1)
+
+        # do attention computation.
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+
+        y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
+
+        y = self.wo(y)
+        return y
+
+
 class FeedForward(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
         super().__init__()
@@ -214,6 +283,9 @@ class FeedForward(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+# TODO: impl. DeepSeekMoE moe layer ; make Deepseek-v2-lite loadable in gpt-fast
 
 
 class RMSNorm(nn.Module):
