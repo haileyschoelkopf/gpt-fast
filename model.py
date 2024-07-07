@@ -318,13 +318,19 @@ class LatentAttention(nn.Module):
 
         wuk, wuv = wukv.split([self.nope_head_dim, self.v_head_dim], dim=1)
 
+        self.wuq_nope = wuq_nope.clone().contiguous().to(dtype=torch.bfloat16)
+
+        self.wuk = wuk.clone().contiguous().to(dtype=torch.bfloat16)
+
+        self.wuv = wuv.clone().contiguous().to(dtype=torch.bfloat16)
+
         # get W_O
         wo = self.wo.weight.view(self.dim, self.n_head, self.v_head_dim)
 
         # produce 'W_UQK', the absorbed combined Q- and K- NoPE up-projection: 
         # wuqk = torch.einsum("n_head nope_head_dim q_lora_rank, n_head nope_head_dim kv_lora_rank -> kv_lora_rank n_head q_lora_rank", wuq_nope, wuk)
-        wuqk = torch.einsum("n h q, n h k -> k n q", wuq_nope, wuk)
-        self.wuqk = wuqk.clone().contiguous().to(dtype=torch.bfloat16)
+        # wuqk = torch.einsum("n h q, n h k -> k n q", wuq_nope, wuk)
+        # self.wuqk = wuqk.clone().contiguous().to(dtype=torch.bfloat16)
 
         # TODO: test this and compare--what if we don't absorb W_UV into W_O?
         self.wuv = wuv.clone().contiguous().to(dtype=torch.bfloat16)
@@ -357,7 +363,7 @@ class LatentAttention(nn.Module):
         # TODO: should KR proj be separate from DKV weight? or better to do it combined
         k_rope = k_rope.view(bsz, -1, 1, self.rope_head_dim)
 
-        # TODO: push kv LN prior to caching
+        # TODO: push kv LN prior to caching?
 
         # use KV cache: cache the compressed_kv ; uncompressed rotary K
         if self.kv_cache is not None:
@@ -400,7 +406,9 @@ class LatentAttention(nn.Module):
         c_q = self.q_lora_norm(self.wdq(x))
 
         #q_nope = torch.einsum('bsz seqlen q_lora_rank, kv_lora_rank n_head q_lora_rank -> bsz seqlen n_head kv_lora_rank', c_q, self.wuqk)
-        q_nope = torch.einsum('b s q, k n q -> b s n k', c_q, self.wuqk)
+        q_nope = torch.einsum('b s q, n h q -> b s n h', c_q, self.wuq_nope)
+
+        q_nope = torch.einsum('b s n h, n h k -> b s n k', q_nope, self.wuk)
         # q_rope = torch.einsum('bsz seqlen q_lora_rank, n_head rope_head_dim q_lora_rank -> bsz seqlen n_head rope_head_dim', c_q, self.wuq_rope)
         q_rope = torch.einsum('b s q, n r q -> b s n r', c_q, self.wuq_rope)
 
@@ -428,7 +436,7 @@ class LatentAttention(nn.Module):
 
         # TODO: don't use cat -- unless torch compile does a good job of making things fast
         # repeat our RoPE MQA K head.
-        k_rope = k_rope.repeat_interleave(self.n_head, dim=2)
+        k_rope = k_rope.repeat_interleave(self.n_head, dim=2) # TODO: still want this?
 
         # print(compressed_kv.shape)
         # concat k_nope, k_rope together ; q_nope, q_rope together
