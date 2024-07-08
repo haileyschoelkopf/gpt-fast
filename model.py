@@ -247,7 +247,7 @@ class LatentAttention(nn.Module):
 
     This implementation referenced the published code in 
     https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite/blob/main/modeling_deepseek.py
-    and implements some of the optimizations described in the MAD-sys blogpost (although I have not atm referenced the madsys code when writing this.)
+    and implements some of the optimizations described in the MAD-sys blogpost.
     """
 
     def __init__(self, config: ModelArgs):
@@ -345,8 +345,9 @@ class LatentAttention(nn.Module):
 
     def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
         if self.config.mla_absorption:
-            return self.forward_absorbed(x, freqs_cis, mask, input_pos)
-        
+            absorbed = self.forward_absorbed(x, freqs_cis, mask, input_pos)
+            # return absorbed
+            
         bsz, seqlen, _ = x.shape
 
         # run q proj (Q_DQ, Q_UQ) and get Q_nope, Q_pe
@@ -396,21 +397,35 @@ class LatentAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 
         y = self.wo(y)
+
+        def compute_error(std: torch.Tensor, x: torch.Tensor):
+            '''
+            Returns the relative L2 and Lmax between two tensors
+            '''
+            from torch import linalg
+            import math
+            rl2e = linalg.vector_norm(std - x) / linalg.vector_norm(std)
+            rlinfe = linalg.vector_norm(std - x, ord=math.inf) / linalg.vector_norm(std, ord=math.inf)
+            return rl2e, rlinfe
+        # print(y - absorbed)
+        print(compute_error(y, absorbed))
         return y
 
     def forward_absorbed(self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
 
         bsz, seqlen, _ = x.shape
 
+        # run q proj (Q_DQ, Q_UQ) and get Q_nope, Q_pe
+        if self.q_lora_rank is not None:
+            q = self.wuq(self.q_lora_norm(self.wdq(x)))
+        else:
+            q = self.wq(x)
 
-        c_q = self.q_lora_norm(self.wdq(x))
+        q = q.view(bsz, seqlen, self.n_head, self.q_head_dim)
+        q_nope, q_rope = q.split([self.nope_head_dim, self.rope_head_dim], dim=-1)
 
-        #q_nope = torch.einsum('bsz seqlen q_lora_rank, kv_lora_rank n_head q_lora_rank -> bsz seqlen n_head kv_lora_rank', c_q, self.wuqk)
-        q_nope = torch.einsum('b s q, n h q -> b s n h', c_q, self.wuq_nope)
-
-        q_nope = torch.einsum('b s n h, n h k -> b s n k', q_nope, self.wuk)
-        # q_rope = torch.einsum('bsz seqlen q_lora_rank, n_head rope_head_dim q_lora_rank -> bsz seqlen n_head rope_head_dim', c_q, self.wuq_rope)
-        q_rope = torch.einsum('b s q, n r q -> b s n r', c_q, self.wuq_rope)
+        # simulate "absorbed" order of operations--run W_UK now on q_nope.
+        q_nope = torch.einsum('b s n h, n h k -> b s k', q_nope, self.wuk)
 
         # run combined DKV + KR --> get compressed KV and k_rope
         compressed_kv, k_rope = self.wdkv_kr(x).split([self.kv_lora_rank, self.rope_head_dim], dim=-1)
@@ -423,7 +438,6 @@ class LatentAttention(nn.Module):
             compressed_kv, k_rope = self.kv_cache.update(input_pos, compressed_kv, k_rope)
 
         compressed_kv = self.kv_lora_norm(compressed_kv)
-
         # # up-project compressed_kv and split out uncompressed k_nope and value states
         # # run wUK, wUV to get uncompressed k_nope and get uncompressed v
         # kv = self.wukv(self.kv_lora_norm(compressed_kv))
@@ -482,11 +496,19 @@ def my_scaled_dot_product_attention(q_rope, q_nope, k_rope, compressed_kv, attn_
     # as in madsys blogpost, split out rope and nope attn weight computation
     attn_weight = q_rope @ k_rope.transpose(-2, -1) * scale_factor
     # TODO: ensure the unsqueeze is doing what we want here
-    attn_weight += q_nope @ compressed_kv.unsqueeze(-3).transpose(-2, -1) * scale_factor
+    # print(attn_weight.shape)
+    # print(q_nope.unsqueeze(1).transpose(-2, -1).shape, compressed_kv.unsqueeze(-3).transpose(-2, -1).shape)
+    new_attn_weight = q_nope.unsqueeze(1).transpose(-2, -1) @ compressed_kv.unsqueeze(-3).transpose(-2, -1) * scale_factor
+    # print(new_attn_weight.shape)
+    # print(attn_weight.shape)
+    # print(new_attn_weight.repeat(1, attn_weight.shape[1], 1, 1).shape)
+    attn_weight += new_attn_weight.repeat(1, attn_weight.shape[1], 1, 1)
+    # print(attn_weight.shape)
     attn_weight += attn_bias
     attn_weight = torch.softmax(attn_weight, dim=-1)
     attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
-    return attn_weight @ compressed_kv
+    # print(compressed_kv.shape)
+    return torch.einsum('b n q s, b s k -> b n q k', attn_weight, compressed_kv)
 
 
 class FeedForward(nn.Module):
